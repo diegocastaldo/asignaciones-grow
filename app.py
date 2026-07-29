@@ -46,41 +46,58 @@ with tab_ias:
             st.error(f"No se pudo leer el archivo: {e}")
             st.stop()
 
+        reparaciones = df.attrs.get("reparaciones", 0)
+        if reparaciones:
+            st.info(
+                f"🔧 El archivo venía con formato dañado (típico de exports re-guardados en Excel). "
+                f"Se repararon {reparaciones} líneas automáticamente. Verificá la vista previa."
+            )
         st.dataframe(df.head(10))
         cols = list(df.columns)
+        detectado = core.detectar_columnas(df)
+        if detectado:
+            st.caption(
+                "Columnas detectadas automáticamente: "
+                + ", ".join(f"{campo} → **{col}**" for campo, col in detectado.items()
+                            if campo in ("nombre", "apellido", "mail"))
+                + ". Corregí abajo si algo no cierra."
+            )
+
+        def _idx(campo, fallback):
+            col = detectado.get(campo)
+            return cols.index(col) if col in cols else core.adivinar_columna(cols, fallback)
 
         c1, c2, c3 = st.columns(3)
-        col_nombre = c1.selectbox(
-            "Columna de Nombre", cols,
-            index=core.adivinar_columna(cols, ["nombre", "first"]),
-        )
-        col_apellido = c2.selectbox(
-            "Columna de Apellido", cols,
-            index=core.adivinar_columna(cols, ["apellido", "last"]),
-        )
-        col_mail = c3.selectbox(
-            "Columna de Mail", cols,
-            index=core.adivinar_columna(cols, ["mail", "correo", "email"]),
-        )
+        col_nombre = c1.selectbox("Columna de Nombre", cols, index=_idx("nombre", ["nombre", "first"]))
+        col_apellido = c2.selectbox("Columna de Apellido", cols, index=_idx("apellido", ["apellido", "last"]))
+        col_mail = c3.selectbox("Columna de Mail", cols, index=_idx("mail", ["mail", "correo", "email"]))
 
         c4, c5, c6 = st.columns(3)
         regla = c4.selectbox(
             "Regla para loginName",
-            options=["mail", "mail_local", "nombre.apellido", "inicial_apellido"],
+            options=["sap_inicial_apellido", "mail", "mail_local", "nombre.apellido", "inicial_apellido"],
             format_func={
-                "mail": "Mail completo (recomendado)",
+                "sap_inicial_apellido": "Inicial + primer apellido, MAYÚSCULAS (APEREZ)",
+                "mail": "Mail completo",
                 "mail_local": "Parte local del mail (antes de @)",
                 "nombre.apellido": "nombre.apellido (normalizado)",
-                "inicial_apellido": "Inicial + apellido (jperez)",
+                "inicial_apellido": "Inicial + apellido, minúsculas (jperez)",
             }.get,
         )
         status = c5.selectbox("Status inicial", ["active", "inactive", "new"])
         incluir_dn = c6.checkbox("Incluir displayName", value=True)
+        max_len = None
+        if regla == "sap_inicial_apellido":
+            max_len = c4.number_input(
+                "Largo máximo del loginName (se trunca el apellido)",
+                min_value=4, max_value=40, value=12,
+            )
 
         if st.button("Generar CSV para IAS", type="primary"):
             res = core.construir_ias(
                 df, col_nombre, col_apellido, col_mail,
                 regla_login=regla, status=status, incluir_display_name=incluir_dn,
+                max_len_login=max_len,
             )
             for a in res.advertencias:
                 st.warning(a)
@@ -138,18 +155,20 @@ with tab_roles:
             st.error(f"No se pudo leer el listado: {e}")
             st.stop()
 
+        rep_in = df_in.attrs.get("reparaciones", 0)
+        if rep_in:
+            st.info(f"🔧 Archivo con formato dañado: se repararon {rep_in} líneas automáticamente.")
         st.dataframe(df_in.head(10))
         cols_in = list(df_in.columns)
+        det_in = core.detectar_columnas(df_in)
+
+        def _idx_in(campo, fallback):
+            col = det_in.get(campo)
+            return cols_in.index(col) if col in cols_in else core.adivinar_columna(cols_in, fallback)
 
         c1, c2 = st.columns(2)
-        col_mail_in = c1.selectbox(
-            "Columna de Mail", cols_in,
-            index=core.adivinar_columna(cols_in, ["mail", "correo", "email"]),
-        )
-        col_roles_in = c2.selectbox(
-            "Columna de Roles", cols_in,
-            index=core.adivinar_columna(cols_in, ["rol", "role"]),
-        )
+        col_mail_in = c1.selectbox("Columna de Mail", cols_in, index=_idx_in("mail", ["mail", "correo", "email"]))
+        col_roles_in = c2.selectbox("Columna de Roles", cols_in, index=_idx_in("roles", ["rol", "role"]))
 
         df_exp = None
         col_mail_exp = col_user_exp = col_uid_exp = col_user_in = None
