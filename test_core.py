@@ -82,3 +82,31 @@ print("\nCatálogo OK:", res6.errores)
 
 # input una-fila-por-rol también funciona (celda con un solo rol)
 print("\nTodos los tests pasaron ✔")
+
+# --- Tests v1.1: detección inteligente, reparación de CSV, regla SAP ---
+import io as _io
+
+_csv_roto = (
+    'USER_NAME,FIRST_NAME,LAST_NAME,EMAIL;;;;;\r\n'
+    '"APEREZ,""Agustin"",""Perez Naves"",""aperez@x.com""";;;\r\n'
+    '"CMORENO,""Carina"",""Moreno"",""cmoreno@x.com""";;\r\n'
+)
+_df = core.leer_archivo(_io.BytesIO(_csv_roto.encode()), 'roto.csv')
+assert _df.attrs['reparaciones'] > 0 and _df.shape == (2, 4), _df.shape
+_det = core.detectar_columnas(_df)
+assert _det['nombre'] == 'FIRST_NAME' and _det['apellido'] == 'LAST_NAME' and _det['mail'] == 'EMAIL'
+
+_res = core.construir_ias(_df, 'FIRST_NAME', 'LAST_NAME', 'EMAIL',
+                          regla_login='sap_inicial_apellido', max_len_login=12)
+assert _res.ok and _res.df.iloc[0]['loginName'] == 'APEREZ'  # solo primer apellido
+
+assert core.generar_login('Ángel', 'Núñez', 'a@b.com', 'sap_inicial_apellido') == 'ANUNEZ'
+assert core.generar_login('Maximiliano', 'Schwarzenegger Villalobos', 'x@y.com',
+                          'sap_inicial_apellido', max_len=12) == 'MSCHWARZENEG'
+
+# detección por contenido sin headers útiles
+_df2 = pd.DataFrame({'A': ['Juan', 'Ana'], 'B': ['Pérez', 'Gómez'],
+                     'C': ['Juan Pérez', 'Ana Gómez'], 'D': ['jp@x.com', 'ag@x.com']})
+_det2 = core.detectar_columnas(_df2)
+assert _det2['mail'] == 'D' and _det2['nombre'] == 'A' and _det2['apellido'] == 'B'
+print("Tests v1.1 OK ✔")
