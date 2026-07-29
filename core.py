@@ -62,7 +62,7 @@ def mail_valido(mail: str) -> bool:
     return bool(_RE_MAIL.match(limpiar(mail)))
 
 
-def generar_login(nombre: str, apellido: str, mail: str, regla: str) -> str:
+def generar_login(nombre: str, apellido: str, mail: str, regla: str, max_len: int | None = None) -> str:
     """Genera loginName según la regla configurada.
 
     Reglas:
@@ -70,12 +70,21 @@ def generar_login(nombre: str, apellido: str, mail: str, regla: str) -> str:
       - "mail_local": la parte local del mail (antes de @)
       - "nombre.apellido": primer nombre + '.' + primer apellido, normalizado
       - "inicial_apellido": inicial del nombre + primer apellido, normalizado
+      - "sap_inicial_apellido": inicial del nombre + PRIMER apellido, en
+        MAYÚSCULAS, truncado a max_len (convención de user ID SAP, default 12)
     """
     mail = limpiar(mail).lower()
     if regla == "mail":
         return mail
     if regla == "mail_local":
         return mail.split("@", 1)[0] if "@" in mail else mail
+    if regla == "sap_inicial_apellido":
+        ini = quitar_acentos(limpiar(nombre)).upper()[:1]
+        primer = limpiar(apellido).split(" ")[0]
+        ape = re.sub(r"[^A-Z0-9]", "", quitar_acentos(primer).upper())
+        login = ini + ape
+        tope = max_len or 12
+        return login[:tope]
     primer_nombre = normalizar_login(limpiar(nombre).split(" ")[0]) if limpiar(nombre) else ""
     primer_apellido = normalizar_login(limpiar(apellido).split(" ")[0]) if limpiar(apellido) else ""
     if regla == "nombre.apellido":
@@ -128,6 +137,7 @@ def construir_ias(
     regla_login: str = "mail",
     status: str = "active",
     incluir_display_name: bool = True,
+    max_len_login: int | None = None,
 ) -> Resultado:
     """Transforma un listado (nombre, apellido, mail) al CSV de import de IAS."""
     res = Resultado()
@@ -155,10 +165,16 @@ def construir_ias(
         if not nombre:
             res.advertencias.append(f"Fila {n_fila}: nombre vacío (firstName quedará en blanco).")
 
-        login = generar_login(nombre, apellido, mail, regla_login)
+        login = generar_login(nombre, apellido, mail, regla_login, max_len=max_len_login)
         if not login:
             res.errores.append(f"Fila {n_fila}: no se pudo generar loginName con la regla '{regla_login}'.")
             continue
+        if regla_login == "sap_inicial_apellido":
+            sin_truncar = generar_login(nombre, apellido, mail, regla_login, max_len=999)
+            if len(sin_truncar) > len(login):
+                res.advertencias.append(
+                    f"Fila {n_fila}: loginName truncado a {len(login)} caracteres: '{sin_truncar}' → '{login}'."
+                )
 
         registro = {
             "status": status,
@@ -344,12 +360,39 @@ def csv_mbu(df: pd.DataFrame, header: list[str] | None = None) -> bytes:
 # Lectura de archivos subidos
 # ---------------------------------------------------------------------------
 
+def _reparar_texto_csv(texto: str) -> tuple[str, int]:
+    """Repara patrones típicos de CSVs rotos por re-guardado en Excel:
+      - separadores ';' de arrastre al final de cada línea (';;;;;')
+      - líneas enteras envueltas en comillas con las comillas internas
+        duplicadas ("APEREZ,""Agustin"",...)
+    Devuelve (texto_reparado, cantidad_de_lineas_reparadas)."""
+    lineas = texto.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    reparadas, n_rep = [], 0
+    for linea in lineas:
+        original = linea
+        linea = re.sub(r"[;\s]+$", "", linea)
+        if linea.startswith('"') and '""' in linea:
+            cuerpo = linea[1:-1] if linea.endswith('"') else linea[1:]
+            linea = cuerpo.replace('""', '"')
+            n_rep += 1
+        elif linea != original.rstrip("\r\n"):
+            n_rep += 1
+        if linea.strip():
+            reparadas.append(linea)
+    return "\n".join(reparadas) + "\n", n_rep
+
+
 def leer_archivo(archivo, nombre: str) -> pd.DataFrame:
-    """Lee un upload de Streamlit (xlsx/xls/csv) a DataFrame, todo como texto."""
+    """Lee un upload de Streamlit (xlsx/xls/csv) a DataFrame, todo como texto.
+
+    Para CSV intenta primero una lectura normal y, si detecta el patrón de
+    archivo roto, lo repara automáticamente. La cantidad de líneas reparadas
+    queda en df.attrs['reparaciones'] para que la UI lo informe."""
     nombre = nombre.lower()
     if nombre.endswith((".xlsx", ".xlsm", ".xls")):
-        return pd.read_excel(archivo, dtype=str).fillna("")
-    # CSV: detectar separador automáticamente (coma o punto y coma)
+        df = pd.read_excel(archivo, dtype=str).fillna("")
+        df.attrs["reparaciones"] = 0
+        return df
     contenido = archivo.read()
     if isinstance(contenido, bytes):
         try:
@@ -358,12 +401,135 @@ def leer_archivo(archivo, nombre: str) -> pd.DataFrame:
             texto = contenido.decode("latin-1")
     else:
         texto = contenido
+
+    def _parsear(t: str) -> pd.DataFrame:
+        # Probar cada separador y quedarse con el que produce más columnas.
+        # (El Sniffer falla con archivos donde un campo interno usa ';',
+        # como la columna ROLES de los exports de SAC.)
+        mejor: pd.DataFrame | None = None
+        for sep in (",", ";", "\t"):
+            df = None
+            for engine in ("c", "python"):
+                try:
+                    df = pd.read_csv(io.StringIO(t), sep=sep, dtype=str, engine=engine).fillna("")
+                    break
+                except Exception:
+                    continue
+            if df is None:
+                continue
+            # Descartar columnas fantasma (header vacío y sin datos) que
+            # generan los ';;;;;' de arrastre, para comparar en limpio
+            fantasma = [
+                c for c in df.columns
+                if str(c).startswith("Unnamed") and not df[c].astype(str).str.strip().any()
+            ]
+            df = df.drop(columns=fantasma)
+            if mejor is None or len(df.columns) > len(mejor.columns):
+                mejor = df
+        if mejor is None:
+            raise ValueError("No se pudo interpretar el archivo como CSV con ',', ';' ni tabulador.")
+        return mejor
+
+    reparado, n_rep = _reparar_texto_csv(texto)
+    if n_rep == 0:
+        df = _parsear(texto)
+        df.attrs["reparaciones"] = 0
+        return df
+    # Hubo reparaciones: parsear ambas versiones y quedarse con la que
+    # produce una tabla más consistente (más columnas bien separadas).
+    df_normal, df_rep = None, None
     try:
-        dialecto = csv.Sniffer().sniff(texto[:4096], delimiters=",;\t")
-        sep = dialecto.delimiter
-    except csv.Error:
-        sep = ","
-    return pd.read_csv(io.StringIO(texto), sep=sep, dtype=str).fillna("")
+        df_normal = _parsear(texto)
+    except Exception:
+        pass
+    try:
+        df_rep = _parsear(reparado)
+    except Exception:
+        pass
+    if df_rep is not None and (df_normal is None or len(df_rep.columns) >= len(df_normal.columns)):
+        df_rep.attrs["reparaciones"] = n_rep
+        return df_rep
+    df_normal.attrs["reparaciones"] = 0
+    return df_normal
+
+
+# Candidatos de nombres de columna por campo (se comparan sin acentos,
+# en minúsculas y con '_' como espacio)
+_CANDIDATOS_COLUMNAS: dict[str, list[str]] = {
+    "nombre": ["first name", "firstname", "nombre", "given name", "primer nombre"],
+    "apellido": ["last name", "lastname", "apellido", "surname", "family name"],
+    "mail": ["e-mail", "email", "mail", "correo"],
+    "roles": ["business role", "role id", "roles", "role", "rol", "perfil"],
+    "username": ["user name", "username", "usuario", "login", "uid"],
+}
+
+
+def _normalizar_header(c: str) -> str:
+    return quitar_acentos(str(c)).lower().replace("_", " ").strip()
+
+
+def detectar_columnas(df: pd.DataFrame) -> dict[str, str]:
+    """Detecta qué columna corresponde a cada campo (nombre, apellido, mail,
+    roles, username), primero por nombre de columna y después por contenido.
+
+    Devuelve un dict campo → nombre de columna (solo los campos detectados)."""
+    resultado: dict[str, str] = {}
+    cols = list(df.columns)
+    headers = [_normalizar_header(c) for c in cols]
+
+    # 1) Por nombre de columna (primer candidato que matchee, en orden)
+    for campo, candidatos in _CANDIDATOS_COLUMNAS.items():
+        for cand in candidatos:
+            hit = next(
+                (i for i, h in enumerate(headers) if h == cand or cand in h),
+                None,
+            )
+            if hit is not None and cols[hit] not in resultado.values():
+                resultado[campo] = cols[hit]
+                break
+
+    # 2) Por contenido: mail (columna con mayor proporción de emails válidos)
+    if "mail" not in resultado:
+        mejor, mejor_score = None, 0.0
+        muestra = df.head(100)
+        for c in cols:
+            valores = [limpiar(v) for v in muestra[c]]
+            valores = [v for v in valores if v]
+            if not valores:
+                continue
+            score = sum(mail_valido(v) for v in valores) / len(valores)
+            if score > mejor_score:
+                mejor, mejor_score = c, score
+        if mejor is not None and mejor_score >= 0.6:
+            resultado["mail"] = mejor
+
+    # 3) Por contenido: si falta nombre o apellido y hay una columna tipo
+    #    display name ("Nombre Apellido"), inferir cuál columna es cuál
+    if ("nombre" not in resultado or "apellido" not in resultado):
+        muestra = df.head(50)
+        candidata_display = None
+        for c in cols:
+            valores = [limpiar(v) for v in muestra[c] if limpiar(v)]
+            if valores and sum(" " in v for v in valores) / len(valores) >= 0.7 \
+               and all(not mail_valido(v) for v in valores[:10]):
+                candidata_display = c
+                break
+        if candidata_display:
+            for c in cols:
+                if c == candidata_display or c in resultado.values():
+                    continue
+                valores_c = [limpiar(v) for v in muestra[c]]
+                valores_d = [limpiar(v) for v in muestra[candidata_display]]
+                pares = [(v, d) for v, d in zip(valores_c, valores_d) if v and d]
+                if not pares:
+                    continue
+                empieza = sum(d.lower().startswith(v.lower()) for v, d in pares) / len(pares)
+                termina = sum(d.lower().endswith(v.lower()) for v, d in pares) / len(pares)
+                if empieza >= 0.7 and "nombre" not in resultado:
+                    resultado["nombre"] = c
+                elif termina >= 0.7 and "apellido" not in resultado:
+                    resultado["apellido"] = c
+    return resultado
 
 
 def adivinar_columna(columnas: list[str], candidatos: list[str]) -> int:
